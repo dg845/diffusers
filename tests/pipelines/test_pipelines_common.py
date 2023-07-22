@@ -17,7 +17,7 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers import KarrasDiffusionSchedulers
 from diffusers.utils import logging
 from diffusers.utils.import_utils import is_accelerate_available, is_accelerate_version, is_xformers_available
-from diffusers.utils.testing_utils import require_torch, torch_device
+from diffusers.utils.testing_utils import CaptureLogger, require_torch, torch_device
 
 
 def to_np(tensor):
@@ -227,7 +227,7 @@ class PipelineTesterMixin:
 
     # set these parameters to False in the child class if the pipeline does not support the corresponding functionality
     test_attention_slicing = True
-    test_cpu_offload = True
+
     test_xformers_attention = True
 
     def get_generator(self, seed):
@@ -298,9 +298,19 @@ class PipelineTesterMixin:
         inputs = self.get_dummy_inputs(torch_device)
         output = pipe(**inputs)[0]
 
+        logger = logging.get_logger("diffusers.pipelines.pipeline_utils")
+        logger.setLevel(diffusers.logging.INFO)
+
         with tempfile.TemporaryDirectory() as tmpdir:
             pipe.save_pretrained(tmpdir)
-            pipe_loaded = self.pipeline_class.from_pretrained(tmpdir)
+
+            with CaptureLogger(logger) as cap_logger:
+                pipe_loaded = self.pipeline_class.from_pretrained(tmpdir)
+
+            for name in pipe_loaded.components.keys():
+                if name not in pipe_loaded._optional_components:
+                    assert name in str(cap_logger)
+
             pipe_loaded.to(torch_device)
             pipe_loaded.set_progress_bar_config(disable=None)
 
@@ -661,9 +671,6 @@ class PipelineTesterMixin:
         reason="CPU offload is only available with CUDA and `accelerate v0.14.0` or higher",
     )
     def test_cpu_offload_forward_pass(self, expected_max_diff=1e-4):
-        if not self.test_cpu_offload:
-            return
-
         components = self.get_dummy_components()
         pipe = self.pipeline_class(**components)
         pipe.to(torch_device)
@@ -699,12 +706,16 @@ class PipelineTesterMixin:
 
         inputs = self.get_dummy_inputs(torch_device)
         output_without_offload = pipe(**inputs)[0]
-        output_without_offload.cpu() if torch.is_tensor(output_without_offload) else output_without_offload
+        output_without_offload = (
+            output_without_offload.cpu() if torch.is_tensor(output_without_offload) else output_without_offload
+        )
 
         pipe.enable_xformers_memory_efficient_attention()
         inputs = self.get_dummy_inputs(torch_device)
         output_with_offload = pipe(**inputs)[0]
-        output_with_offload.cpu() if torch.is_tensor(output_with_offload) else output_without_offload
+        output_with_offload = (
+            output_with_offload.cpu() if torch.is_tensor(output_with_offload) else output_without_offload
+        )
 
         if test_max_difference:
             max_diff = np.abs(output_with_offload - output_without_offload).max()

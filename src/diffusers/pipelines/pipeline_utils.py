@@ -463,17 +463,18 @@ class DiffusionPipeline(ConfigMixin):
     provides methods for loading, downloading and saving models. It also includes methods to:
 
         - move all PyTorch modules to the device of your choice
-        - enabling/disabling the progress bar for the denoising iteration
+        - enable/disable the progress bar for the denoising iteration
 
     Class attributes:
 
         - **config_name** (`str`) -- The configuration filename that stores the class and module names of all the
           diffusion pipeline's components.
-        - **_optional_components** (List[`str`]) -- List of all optional components that don't have to be passed to the
+        - **_optional_components** (`List[str]`) -- List of all optional components that don't have to be passed to the
           pipeline to function (should be overridden by subclasses).
     """
     config_name = "model_index.json"
     _optional_components = []
+    _exclude_from_cpu_offload = []
 
     def register_modules(self, **kwargs):
         # import it here to avoid circular import
@@ -556,6 +557,7 @@ class DiffusionPipeline(ConfigMixin):
         model_index_dict.pop("_class_name", None)
         model_index_dict.pop("_diffusers_version", None)
         model_index_dict.pop("_module", None)
+        model_index_dict.pop("_name_or_path", None)
 
         expected_modules, optional_kwargs = self._get_signature_keys(self)
 
@@ -1013,7 +1015,7 @@ class DiffusionPipeline(ConfigMixin):
         from diffusers import pipelines
 
         # 6. Load each module in the pipeline
-        for name, (library_name, class_name) in init_dict.items():
+        for name, (library_name, class_name) in tqdm(init_dict.items(), desc="Loading pipeline components..."):
             # 6.1 - now that JAX/Flax is an official framework of the library, we might load from Flax names
             if class_name.startswith("Flax"):
                 class_name = class_name[4:]
@@ -1055,6 +1057,9 @@ class DiffusionPipeline(ConfigMixin):
                     low_cpu_mem_usage=low_cpu_mem_usage,
                     cached_folder=cached_folder,
                 )
+                logger.info(
+                    f"Loaded {name} as {class_name} from `{name}` subfolder of {pretrained_model_name_or_path}."
+                )
 
             init_kwargs[name] = loaded_sub_model  # UNet(...), # DiffusionSchedule(...)
 
@@ -1073,7 +1078,70 @@ class DiffusionPipeline(ConfigMixin):
 
         # 8. Instantiate the pipeline
         model = pipeline_class(**init_kwargs)
+
+        # 9. Save where the model was instantiated from
+        model.register_to_config(_name_or_path=pretrained_model_name_or_path)
         return model
+
+    @property
+    def name_or_path(self) -> str:
+        return getattr(self.config, "_name_or_path", None)
+
+    @property
+    def _execution_device(self):
+        r"""
+        Returns the device on which the pipeline's models will be executed. After calling
+        [`~DiffusionPipeline.enable_sequential_cpu_offload`] the execution device can only be inferred from
+        Accelerate's module hooks.
+        """
+        for name, model in self.components.items():
+            if not isinstance(model, torch.nn.Module) or name in self._exclude_from_cpu_offload:
+                continue
+
+            if not hasattr(model, "_hf_hook"):
+                return self.device
+            for module in model.modules():
+                if (
+                    hasattr(module, "_hf_hook")
+                    and hasattr(module._hf_hook, "execution_device")
+                    and module._hf_hook.execution_device is not None
+                ):
+                    return torch.device(module._hf_hook.execution_device)
+        return self.device
+
+    def enable_sequential_cpu_offload(self, gpu_id: int = 0, device: Union[torch.device, str] = "cuda"):
+        r"""
+        Offloads all models to CPU using accelerate, significantly reducing memory usage. When called, unet,
+        text_encoder, vae and safety checker have their state dicts saved to CPU and then are moved to a
+        `torch.device('meta') and loaded to GPU only when their specific submodule has its `forward` method called.
+        Note that offloading happens on a submodule basis. Memory savings are higher than with
+        `enable_model_cpu_offload`, but performance is lower.
+        """
+        if is_accelerate_available() and is_accelerate_version(">=", "0.14.0"):
+            from accelerate import cpu_offload
+        else:
+            raise ImportError("`enable_sequential_cpu_offload` requires `accelerate v0.14.0` or higher")
+
+        if device == "cuda":
+            device = torch.device(f"{device}:{gpu_id}")
+
+        if self.device.type != "cpu":
+            self.to("cpu", silence_dtype_warnings=True)
+            device_mod = getattr(torch, self.device.type, None)
+            if hasattr(device_mod, "empty_cache") and device_mod.is_available():
+                device_mod.empty_cache()  # otherwise we don't see the memory savings (but they probably exist)
+
+        for name, model in self.components.items():
+            if not isinstance(model, torch.nn.Module):
+                continue
+
+            if name in self._exclude_from_cpu_offload:
+                model.to(device)
+            else:
+                # make sure to offload buffers if not all high level weights
+                # are of type nn.Module
+                offload_buffers = len(model._parameters) > 0
+                cpu_offload(model, device, offload_buffers=offload_buffers)
 
     @classmethod
     def download(cls, pretrained_model_name, **kwargs) -> Union[str, os.PathLike]:
@@ -1213,6 +1281,15 @@ class DiffusionPipeline(ConfigMixin):
             filenames = {sibling.rfilename for sibling in info.siblings}
             model_filenames, variant_filenames = variant_compatible_siblings(filenames, variant=variant)
 
+            if len(variant_filenames) == 0 and variant is not None:
+                deprecation_message = (
+                    f"You are trying to load the model files of the `variant={variant}`, but no such modeling files are available."
+                    f"The default model files: {model_filenames} will be loaded instead. Make sure to not load from `variant={variant}`"
+                    "if such variant modeling files are not available. Doing so will lead to an error in v0.22.0 as defaulting to non-variant"
+                    "modeling files is deprecated."
+                )
+                deprecate("no variant default", "0.22.0", deprecation_message, standard_warn=False)
+
             # remove ignored filenames
             model_filenames = set(model_filenames) - set(ignore_filenames)
             variant_filenames = set(variant_filenames) - set(ignore_filenames)
@@ -1302,7 +1379,7 @@ class DiffusionPipeline(ConfigMixin):
             snapshot_folder = Path(config_file).parent
             pipeline_is_cached = all((snapshot_folder / f).is_file() for f in expected_files)
 
-            if pipeline_is_cached:
+            if pipeline_is_cached and not force_download:
                 # if the pipeline is cached, we can directly return it
                 # else call snapshot_download
                 return snapshot_folder
@@ -1398,10 +1475,9 @@ class DiffusionPipeline(ConfigMixin):
 
     def enable_xformers_memory_efficient_attention(self, attention_op: Optional[Callable] = None):
         r"""
-        Enable memory efficient attention from [xFormers](https://facebookresearch.github.io/xformers/).
-
-        When this option is enabled, you should observe lower GPU memory usage and a potential speed up during
-        inference. Speed up during training is not guaranteed.
+        Enable memory efficient attention from [xFormers](https://facebookresearch.github.io/xformers/). When this
+        option is enabled, you should observe lower GPU memory usage and a potential speed up during inference. Speed
+        up during training is not guaranteed.
 
         <Tip warning={true}>
 
@@ -1460,10 +1536,9 @@ class DiffusionPipeline(ConfigMixin):
 
     def enable_attention_slicing(self, slice_size: Optional[Union[str, int]] = "auto"):
         r"""
-        Enable sliced attention computation.
-
-        When this option is enabled, the attention module splits the input tensor in slices to compute attention in
-        several steps. This is useful to save some memory in exchange for a small speed decrease.
+        Enable sliced attention computation. When this option is enabled, the attention module splits the input tensor
+        in slices to compute attention in several steps. This is useful to save some memory in exchange for a small
+        speed decrease.
 
         Args:
             slice_size (`str` or `int`, *optional*, defaults to `"auto"`):
