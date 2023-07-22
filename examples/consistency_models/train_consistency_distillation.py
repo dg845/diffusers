@@ -292,7 +292,7 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{organization}/{model_id}"
 
 
-def get_scalings(self, sigma, sigma_data=0.5):
+def get_heun_scalings(sigma, sigma_data=0.5):
     """
     Get scalings for Karras Heun scheduler.
     TODO: can we use HeunDiscreteScheduler here?
@@ -301,6 +301,49 @@ def get_scalings(self, sigma, sigma_data=0.5):
     c_out = sigma * sigma_data / (sigma**2 + sigma_data**2) ** 0.5
     c_in = 1 / (sigma**2 + sigma_data**2) ** 0.5
     return c_skip, c_out, c_in
+
+
+def get_heun_denoising_output(
+    model_output,
+    sample,
+    sigmas,
+    index,
+    gamma=0,
+    prediction_type="sample",
+    first_order=False,
+):
+    """
+    Gets the Karras Heun denoising output based on the prediction type, model_output, and sample.
+    """
+    # Follows diffusers.schedulers.scheduling_heun_discrete.HeunDiscreteScheduler.step
+    if first_order:
+        sigma = sigmas[index]
+        sigma_next = sigmas[index + 1]
+    else:
+        sigma = sigmas[index - 1]
+        sigma_next = sigmas[index]
+    # TODO: get shapes correct
+    if prediction_type == "sample" or prediction_type == "original_sample":
+        denoising_output = model_output
+    elif prediction_type == "epsilon":
+        sigma_hat = sigma * (gamma + 1)
+        sigma_input = sigma_hat if first_order else sigma_next
+
+        denoising_output = sample - sigma_input * model_output
+    elif prediction_type == "v_prediction":
+        sigma_hat = sigma * (gamma + 1)
+        sigma_input = sigma_hat if first_order else sigma_next
+        # Not sure if this is right...
+        c_skip = 1 / (sigma_input ** 2 + 1)
+        c_out = -sigma_input / (sigma_input ** 2 + 1) ** 0.5
+
+        denoising_output = c_skip * sample + c_out * model_output
+    else:
+        raise ValueError(
+                f"prediction_type given as {prediction_type} must be one of `epsilon`, `v_prediction`, or `sample`."
+            )
+    
+    return denoising_output
 
 
 def main(args):
@@ -386,6 +429,7 @@ def main(args):
     teacher_pipeline = DiffusionPipeline.from_pretrained(args.pretrained_teacher_model_name_or_path)
     teacher_model = teacher_pipeline.unet
     teacher_scheduler = teacher_pipeline.scheduler
+    teacher_prediction_type = teacher_scheduler.config.prediction_type
     num_scales = 40
 
     # Check that all trainable models are in full precision
@@ -553,10 +597,10 @@ def main(args):
                 0, noise_scheduler.config.num_train_timesteps-1,  (1,), device=accelerator.device
             ).long()
             # timestep is the scaled timestep, sigma is the unscaled timestep
-            timestep = timesteps[index+1]
-            sigma = sigmas[index+1]
-            timestep_prev = timesteps[index]
-            sigma_prev = sigmas[index]
+            timestep = timesteps[index]
+            sigma = sigmas[index]
+            timestep_prev = timesteps[index + 1]
+            sigma_prev = sigmas[index + 1]
             # add noise expects the scaled timestep only and internally converts to sigma
             noised_image = noise_scheduler.add_noise(clean_images, noise, timestep)
             target_model_ema.copy_to(target_model.parameters())
@@ -574,17 +618,20 @@ def main(args):
 
                     # 1. Get scalings for Karras Heun sampler based on current sigma
                     # TODO: could we use HeunDiscreteScheduler instead?
-                    c_skip, c_out, c_in = get_scalings(sigma)
+                    c_skip, c_out, c_in = get_heun_scalings(sigma)
 
                     # 2. Get current Karras ODE derivative
                     # 2.1. Scale noised_image according to Karras Heun sampler
                     scaled_teacher_model_input = c_in * noised_image
                     # 2.2. Get teacher unet output on noised_image
                     teacher_model_output = teacher_model(scaled_teacher_model_input, timestep, class_labels=labels)
-                    # 2.3. Get teacher denoising output according to Karras Heun sampler
-                    # TODO: get the shapes correct
+                    # 2.3 Apply output preconditioning? (not sure if this is right...)
                     teacher_denoising_output = c_skip * noised_image + c_out * teacher_model_output
-                    # 2.4. Get current Karras ODE derivative based on teacher_denoising_output
+                    # 2.4. Get teacher denoising output according to the teacher model prediction type
+                    teacher_denoising_output = get_heun_denoising_output(
+                        teacher_model_output, noised_image, sigmas, index, prediction_type=teacher_prediction_type
+                    )
+                    # 2.5. Get current Karras ODE derivative based on teacher_denoising_output
                     d = (noised_image - teacher_denoising_output) / sigma[(...,) + (None,) * 3]
 
                     # 3. Take a Euler step
@@ -596,6 +643,9 @@ def main(args):
                     scaled_samples = c_in * samples
                     teacher_model_output = teacher_model(scaled_samples, timestep_prev, class_labels=labels).sample
                     teacher_denoising_output = c_skip * samples + c_out * teacher_model_output
+                    teacher_denoising_output = get_heun_denoising_output(
+                        teacher_model_output, samples, sigmas, index + 1, prediction_type=teacher_prediction_type
+                    )
                     next_d = (samples - teacher_denoising_output) / sigma_prev[(...,) + (None,) * 3]
 
                     # 5. Apply 2nd order Heun correction to get a (partially) denoised image by one step
