@@ -292,6 +292,17 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{organization}/{model_id}"
 
 
+def get_scalings(self, sigma, sigma_data=0.5):
+    """
+    Get scalings for Karras Heun scheduler.
+    TODO: can we use HeunDiscreteScheduler here?
+    """
+    c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
+    c_out = sigma * sigma_data / (sigma**2 + sigma_data**2) ** 0.5
+    c_in = 1 / (sigma**2 + sigma_data**2) ** 0.5
+    return c_skip, c_out, c_in
+
+
 def main(args):
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -551,7 +562,7 @@ def main(args):
             target_model_ema.copy_to(target_model.parameters())
 
             with accelerator.accumulate(model):
-                # Predict the noise residual
+                # Get the current output of the (online) consistency model on the noised image
                 model_output = model(noise_scheduler.scale_model_input(noised_image, timestep), timestep, class_labels=labels).sample
                 distiller = noise_scheduler.step(
                     model_output, timestep, noised_image, use_noise=False
@@ -560,29 +571,45 @@ def main(args):
                 with torch.no_grad():
                     # Heun Solver to get previous timestep image using teacher model
                     # TODO - make this cleaner
-                    samples = noised_image
-                    x = samples
-                    teacher_model_output = teacher_model(noise_scheduler.scale_model_input(x, timestep), timestep, class_labels=labels).sample
-                    teacher_denoiser = noise_scheduler.step(
-                        teacher_model_output, timestep, x, use_noise=False
-                    ).prev_sample
-                    d = (x - teacher_denoiser) / sigma[(...,) + (None,) * 3]
-                    samples = x + d * (sigma_prev - sigma)[(...,) + (None,) * 3]
-                    # We probably want to use Sigma for an arbitrary teacher model here, since that corresponds to the unscaled timestep
-                    # We just want a denoised image from an input x, t using the teacher model, since that is used in the score function
-                    # So we should figure out how to get the denoised image from the teacher model
-                    teacher_model_output = teacher_model(noise_scheduler.scale_model_input(samples, timestep_prev), timestep_prev, class_labels=labels).sample
-                    teacher_denoiser = noise_scheduler.step(
-                        teacher_model_output, timestep_prev, samples, use_noise=False
-                    ).prev_sample
-                    next_d = (samples - teacher_denoiser) / sigma_prev[(...,) + (None,) * 3]
-                    denoised_image = x + (d + next_d) * ((sigma_prev - sigma) /2)[(...,) + (None,) * 3]
-                    # get output from target model
+
+                    # 1. Get scalings for Karras Heun sampler based on current sigma
+                    # TODO: could we use HeunDiscreteScheduler instead?
+                    c_skip, c_out, c_in = get_scalings(sigma)
+
+                    # 2. Get current Karras ODE derivative
+                    # 2.1. Scale noised_image according to Karras Heun sampler
+                    scaled_teacher_model_input = c_in * noised_image
+                    # 2.2. Get teacher unet output on noised_image
+                    teacher_model_output = teacher_model(scaled_teacher_model_input, timestep, class_labels=labels)
+                    # 2.3. Get teacher denoising output according to Karras Heun sampler
+                    # TODO: get the shapes correct
+                    teacher_denoising_output = c_skip * noised_image + c_out * teacher_model_output
+                    # 2.4. Get current Karras ODE derivative based on teacher_denoising_output
+                    d = (noised_image - teacher_denoising_output) / sigma[(...,) + (None,) * 3]
+
+                    # 3. Take a Euler step
+                    samples = noised_image + d * (sigma_prev - sigma)[(...,) + (None,) * 3]
+
+                    # 4. Get next Karras ODE derivative
+                    # Logic is analogous to Step 2, but on samples and timestep_prev instead of noised_image and
+                    # timestep
+                    scaled_samples = c_in * samples
+                    teacher_model_output = teacher_model(scaled_samples, timestep_prev, class_labels=labels).sample
+                    teacher_denoising_output = c_skip * samples + c_out * teacher_model_output
+                    next_d = (samples - teacher_denoising_output) / sigma_prev[(...,) + (None,) * 3]
+
+                    # 5. Apply 2nd order Heun correction to get a (partially) denoised image by one step
+                    denoised_image = noised_image + (d + next_d) * ((sigma_prev - sigma) /2)[(...,) + (None,) * 3]
+                    
+                    # We've gotten the one step denoised image from the Heun sampler
+                    # Now evaluate the target consistency model on the denoised_image and previous timestep to
+                    # calculate the distillation target
                     target_model_output = target_model(noise_scheduler.scale_model_input(denoised_image, timestep_prev), timestep_prev, class_labels=labels).sample
                     distiller_target = noise_scheduler.step(
                         target_model_output, timestep_prev, denoised_image, use_noise=False
                     ).prev_sample
-
+                
+                # We want the current output of the consistency model distiller to match distiller_target.
                 loss = F.mse_loss(distiller, distiller_target) 
                 loss = loss.mean()
 
