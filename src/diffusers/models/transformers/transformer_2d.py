@@ -1,4 +1,4 @@
-# Copyright 2023 The HuggingFace Team. All rights reserved.
+# Copyright 2024 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -97,6 +97,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         norm_eps: float = 1e-5,
         attention_type: str = "default",
         caption_channels: int = None,
+        interpolation_scale: float = None,
     ):
         super().__init__()
         self.use_linear_projection = use_linear_projection
@@ -168,8 +169,9 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             self.width = sample_size
 
             self.patch_size = patch_size
-            interpolation_scale = self.config.sample_size // 64  # => 64 (= 512 pixart) has interpolation scale 1
-            interpolation_scale = max(interpolation_scale, 1)
+            interpolation_scale = (
+                interpolation_scale if interpolation_scale is not None else max(self.config.sample_size // 64, 1)
+            )
             self.pos_embed = PatchEmbed(
                 height=sample_size,
                 width=sample_size,
